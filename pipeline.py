@@ -196,22 +196,25 @@ class ETLPipeline():
             
             cme_df_concat = pd.concat([cme_df_analyses_explode, cme_df_analyses_normalize[['isMostAccurate', 'time21_5', 'halfAngle',
                                                                                            'speed', 'type', 'latitude',
-                                                                                           'longitude', 'levelOfData']]], axis=1)
+                                                                                           'longitude', 'levelOfData']]],
+                                                                                            axis=1)
+            # print(cme_df_concat.columns)
             
-            cme_df_concat = cme_df_concat[cme_df_concat['isMostAccurate'] == True].reset_index(drop=True)
+            cme_df_concat = cme_df_concat[cme_df_concat['isMostAccurate'] == True]
             cme_df_concat = cme_df_concat.sort_values(by='levelOfData', ascending=False)
+            cme_df_concat = cme_df_concat.drop('isMostAccurate', axis=1).reset_index(drop=True)
             cme_df_concat = cme_df_concat.drop_duplicates(subset='activityID')
             
             cme_df_concat['time21_5'] = pd.to_datetime(cme_df_concat['time21_5'], format='ISO8601')
             
-            cme_df_concat = cme_df_concat.drop('cmeAnalyses', axis=1)
+            cme_df_concat = cme_df_concat.drop('cmeAnalyses', axis=1).reset_index(drop=True)
             
             return cme_df_concat
             
         if data_type == "FLR":
             flares_df = flr_clean_filter(df)
             event_links_flr = event_links_filter(flares_df, 'flrID')
-            flares_df = flares_df.drop('linkedEvents', axis=1)
+            flares_df = flares_df.drop(['linkedEvents', 'instruments'], axis=1).reset_index(drop=True)
             df_dict = {
                 'flares': flares_df,
                 'event_links': event_links_flr
@@ -248,7 +251,7 @@ class ETLPipeline():
             event_links_cme = event_links_filter(cmes_df, 'activityID')
             cmes_df = cmes_df.drop('linkedEvents', axis=1)
             cmes_analyses = cme_analysis_filter(cmes_df)
-            cmes_df = cmes_df.drop('cmeAnalyses', axis=1)
+            cmes_df = cmes_df.drop(['cmeAnalyses', 'instruments'], axis=1).reset_index(drop=True)
             df_dict = {
                 'cmes': cmes_df,
                 'event_links': event_links_cme,
@@ -260,12 +263,164 @@ class ETLPipeline():
                 f"Unsupported data_type {data_type!r}; expected one of 'FLR', 'GST', 'CME'"
             )
     
+    @staticmethod
+    def load(df: pd.DataFrame, db_name: str, table_name: str | list):
+        df_times = df.select_dtypes(include=['datetime', 'datetimetz'])
+        df_times = df_times.apply(lambda x: x.dt.strftime('%Y-%m-%dT%H:%M:%SZ'))
+        df[df_times.columns] = df_times
+        df = df.astype(object).where(df.notna(), None)
+        with sqlite3.connect(db_name) as conn:
+            
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA foreign_keys = ON")
+            match table_name:
+                case 'flares':
+                    cursor.execute("""
+                                    CREATE TABLE IF NOT EXISTS flares (
+                                        flrID TEXT PRIMARY KEY,
+                                        catalog TEXT,
+                                        beginTime TEXT,
+                                        peakTime TEXT,
+                                        endTime TEXT,
+                                        sourceLocation TEXT,
+                                        activeRegionNum INT,
+                                        note TEXT,
+                                        submissionTime TEXT,
+                                        versionId INT,
+                                        link TEXT,
+                                        flareClass TEXT,
+                                        flareMag FLOAT,
+                                        peakFluxWm2 FLOAT,
+                                        lat INT,
+                                        lon INT)
+                                        """)
+                    
+                    query = """INSERT OR REPLACE INTO flares (
+                                flrID, catalog, beginTime, peakTime,
+                                endTime, sourceLocation, activeRegionNum, note,
+                                submissionTime, versionID, link, flareClass,
+                                flareMag, peakFluxWm2, lat, lon) VALUES (
+                                    ?, ?, ?, ?, ?, ?, ?, ?,
+                                    ?, ?, ?, ?, ?, ?, ?, ?)"""
+                
+                case 'cmes':
+                    cursor.execute("""
+                                    CREATE TABLE IF NOT EXISTS cmes (
+                                        activityID TEXT PRIMARY KEY,
+                                        catalog TEXT,
+                                        startTime TEXT,
+                                        sourceLocation TEXT,
+                                        activeRegionNum INT,
+                                        note TEXT,
+                                        submissionTime TEXT,
+                                        versionId INT,
+                                        link TEXT,
+                                        lat INT,
+                                        lon INT)
+                                    """)
+                    
+                    query = """INSERT OR REPLACE INTO cmes (
+                                activityID, catalog, startTime, sourceLocation,
+                                activeRegionNum, note, submissionTime, versionID,
+                                link, lat, lon) VALUES (
+                                    ?, ?, ?, ?, ?, ?, ?, ?,
+                                    ?, ?, ?)"""
+                
+                case 'storms':
+                    cursor.execute("""
+                                   CREATE TABLE IF NOT EXISTS storms (
+                                        gstID TEXT PRIMARY KEY,
+                                        startTime TEXT,
+                                        link TEXT,
+                                        submissionTime TEXT,
+                                        versionId INT,
+                                        max_kp FLOAT,
+                                        first_obs TEXT,
+                                        last_obs TEXT,
+                                        storm_duration_hours FLOAT
+                                    )
+                                    """)
+                    
+                    query = """INSERT OR REPLACE INTO storms (
+                                gstID, startTime, link,
+                                submissionTime, versionId, max_kp,
+                                first_obs, last_obs, storm_duration_hours) VALUES (
+                                    ?, ?, ?,
+                                    ?, ?, ?,
+                                    ?, ?, ?)"""
+                
+                case 'kp_observations':
+                    cursor.execute("""
+                                   CREATE TABLE IF NOT EXISTS kp_observations (
+                                        gstID TEXT,
+                                        observedTime TEXT,
+                                        kpIndex FLOAT,
+                                        source TEXT,
+                                        PRIMARY KEY (gstID, observedTime),
+                                        FOREIGN KEY (gstID) REFERENCES storms(gstID)
+                                    )
+                                    """)
+                    
+                    query = """INSERT OR REPLACE INTO kp_observations (
+                                gstID, observedTime,
+                                kpIndex, source) VALUES (
+                                    ?, ?, ?, ?)"""
+                                    
+                case 'cme_analyses':
+                    cursor.execute("""
+                                    CREATE TABLE IF NOT EXISTS cme_analyses (
+                                        activityID TEXT PRIMARY KEY REFERENCES cmes(activityID),
+                                        time21_5 TEXT,
+                                        halfAngle FLOAT,
+                                        speed FLOAT,
+                                        cme_type TEXT,
+                                        latitude FLOAT NOT NULL,
+                                        longitude FLOAT,
+                                        levelOfData INT
+                                    )
+                                    """)
+                    
+                    query = """INSERT OR REPLACE INTO cme_analyses (
+                                activityID, time21_5, halfAngle, speed,
+                                cme_type, latitude, longitude, levelOfData) VALUES (
+                                    ?, ?, ?, ?,
+                                    ?, ?, ?, ?)"""
+                
+                case 'event_links':
+                    cursor.execute("""
+                                   CREATE TABLE IF NOT EXISTS event_links (
+                                       source_id TEXT NOT NULL,
+                                       linked_id TEXT NOT NULL,
+                                       PRIMARY KEY (source_id, linked_id)
+                                   )
+                                   """)
+                    
+                    query = """INSERT OR REPLACE INTO event_links (
+                                source_id, linked_id) VALUES (
+                                    ?, ?)"""
+                            
+            cursor.executemany(query, df.itertuples(index=False, name=None))
+            
+        print("Function completed run")
+        
 if __name__ == "__main__":
     temp = ETLPipeline()
-    temp_out = temp.extract("GST", "2024-05-01", "2024-06-01")
-    transform_out = ETLPipeline.transform(temp_out, 'GST')
-    for df in transform_out.values():
-        print(df.shape)
-    # for event in transform_out['activeRegionNum']:
-    #     print(str(type(event)), ':', event)
-    # print(transform_out[['link', 'linkedEvents']].head(10))
+    cme_raw = temp.extract("CME", "2024-05-01", "2024-06-01")
+    gst_raw = temp.extract("GST", "2024-05-01", "2024-06-01")
+    flr_raw = temp.extract("FLR", "2024-05-01", "2024-06-01")
+
+    cmes_out = ETLPipeline.transform(cme_raw, 'CME')
+    gst_out = ETLPipeline.transform(gst_raw, 'GST')
+    flr_out = ETLPipeline.transform(flr_raw, 'FLR')
+    
+    ETLPipeline().load(cmes_out['cmes'], 'nasaDonki.db', 'cmes')
+    ETLPipeline().load(cmes_out['event_links'], 'nasaDonki.db', 'event_links')
+    ETLPipeline().load(cmes_out['cme_analyses'], 'nasaDonki.db', 'cme_analyses')
+    
+    ETLPipeline().load(gst_out['storms'], 'nasaDonki.db', 'storms')
+    ETLPipeline().load(gst_out['event_links'], 'nasaDonki.db', 'event_links')
+    ETLPipeline().load(gst_out['kp_observations'], 'nasaDonki.db', 'kp_observations')
+    
+    ETLPipeline().load(flr_out['flares'], 'nasaDonki.db', 'flares')
+    ETLPipeline().load(flr_out['event_links'], 'nasaDonki.db', 'event_links')
+    
